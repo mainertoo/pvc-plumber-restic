@@ -15,8 +15,9 @@ const (
 // `pvc_plumber_backup_check_total{backend="…"}` metrics or filters logs by
 // backend label — see CHANGELOG v3.0.0 for the migration guidance.
 const (
-	TypeS3      = "s3"
-	TypeKopiaS3 = "kopia-s3"
+	TypeS3       = "s3"
+	TypeKopiaS3  = "kopia-s3"
+	TypeResticS3 = "restic-s3"
 )
 
 // CheckResult represents the result of a backup existence check.
