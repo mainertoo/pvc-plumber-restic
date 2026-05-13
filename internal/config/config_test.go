@@ -87,6 +87,14 @@ const (
 	// Restic-S3 fixture values used across the restic-s3 backend table.
 	testResticRepository = "s3:https://garage.lab.example/volsync-shared/restic"
 	testResticPassword   = "rp"
+
+	// Shared table-test case names + values used across multiple
+	// ConnectTimeout / ReWarmInterval suites — promoted to constants so
+	// adding new backends doesn't trip goconst at threshold 3.
+	tcExplicit2m       = "explicit 2m"
+	tcUnparseableName  = "unparseable rejected"
+	tcNegativeRejected = "negative rejected"
+	tcGarbageValue     = "garbage"
 )
 
 // snapshotEnv saves the current values of allEnvVars; restoreEnv puts them
@@ -334,10 +342,10 @@ func TestLoad_ReWarmInterval(t *testing.T) {
 	}{
 		{"default when unset", "", false, 90 * time.Second},
 		{"explicit 60s", "60s", false, 60 * time.Second},
-		{"explicit 2m", "2m", false, 2 * time.Minute},
+		{tcExplicit2m, "2m", false, 2 * time.Minute},
 		{"zero disables", "0s", false, 0},
-		{"negative rejected", "-30s", true, 0},
-		{"unparseable rejected", "garbage", true, 0},
+		{tcNegativeRejected, "-30s", true, 0},
+		{tcUnparseableName, tcGarbageValue, true, 0},
 	}
 
 	for _, tt := range tests {
@@ -647,10 +655,10 @@ func TestLoad_KopiaS3Backend_ConnectTimeoutOverride(t *testing.T) {
 		want    time.Duration
 	}{
 		{"explicit 30s", "30s", false, 30 * time.Second},
-		{"explicit 2m", "2m", false, 2 * time.Minute},
-		{"unparseable rejected", "garbage", true, 0},
+		{tcExplicit2m, "2m", false, 2 * time.Minute},
+		{tcUnparseableName, tcGarbageValue, true, 0},
 		{"zero rejected", "0s", true, 0},
-		{"negative rejected", "-5s", true, 0},
+		{tcNegativeRejected, "-5s", true, 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -897,10 +905,10 @@ func TestLoad_ResticS3Backend_ConnectTimeoutOverride(t *testing.T) {
 		want    time.Duration
 	}{
 		{"explicit 30s", "30s", false, 30 * time.Second},
-		{"explicit 2m", "2m", false, 2 * time.Minute},
-		{"unparseable rejected", "garbage", true, 0},
+		{tcExplicit2m, "2m", false, 2 * time.Minute},
+		{tcUnparseableName, tcGarbageValue, true, 0},
 		{"zero rejected", "0s", true, 0},
-		{"negative rejected", "-5s", true, 0},
+		{tcNegativeRejected, "-5s", true, 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
