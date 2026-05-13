@@ -22,14 +22,16 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} go build -a -installsuf
 # Final stage - with shell for debugging
 FROM alpine:3.21
 
-RUN apk add --no-cache ca-certificates curl tzdata
+# restic comes from Alpine community repo. Mirrors Dockerfile (prod);
+# debug image keeps kopia too for parity with the v3.x deployment shape.
+RUN apk add --no-cache ca-certificates curl tzdata restic
 
 WORKDIR /
 
 # Copy pvc-plumber binary
 COPY --from=builder /build/pvc-plumber /pvc-plumber
 
-# Copy kopia binary
+# Copy kopia binary (legacy backend; unreachable when BACKEND_TYPE=restic-s3)
 COPY --from=kopia /bin/kopia /usr/local/bin/kopia
 
 # Create non-root user matching VolSync mover UID

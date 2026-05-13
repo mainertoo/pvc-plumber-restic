@@ -2,7 +2,7 @@
 
 # Variables
 BINARY_NAME=pvc-plumber
-DOCKER_IMAGE=ghcr.io/mitchross/pvc-plumber
+DOCKER_IMAGE=ghcr.io/mainertoo/pvc-plumber-restic
 VERSION?=$(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 LDFLAGS=-ldflags "-X main.version=$(VERSION)"
 

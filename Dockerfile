@@ -25,14 +25,18 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} go build -a -installsuf
 # Final stage - use alpine for kopia compatibility
 FROM alpine:3.21
 
-RUN apk add --no-cache ca-certificates tzdata
+# restic comes from the Alpine community repo (enabled by default).
+# The fork keeps the kopia binary too because the kopia code path still
+# compiles — running with BACKEND_TYPE=restic-s3 in production is the
+# selector. Pinning will land at Phase 4+ once the shadow soaks clean.
+RUN apk add --no-cache ca-certificates tzdata restic
 
 WORKDIR /
 
 # Copy pvc-plumber binary
 COPY --from=builder /build/pvc-plumber /pvc-plumber
 
-# Copy kopia binary
+# Copy kopia binary (legacy backend; unreachable when BACKEND_TYPE=restic-s3)
 COPY --from=kopia /bin/kopia /usr/local/bin/kopia
 
 # Create non-root user matching VolSync mover UID
