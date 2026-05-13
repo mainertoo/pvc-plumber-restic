@@ -63,6 +63,9 @@ var allEnvVars = []string{
 	"RE_WARM_INTERVAL",
 	// v3.1.0 lazy-credentials env vars
 	envKopiaCredentialsPath, envKopiaConnectTimeout,
+	// Restic backend env vars (the fork's additions)
+	envResticRepository, envResticPassword, envResticCredentialsPath,
+	envResticConnectTimeout, envResticCacheDir,
 }
 
 // v3.1.0 env-var names. Promoted to constants because the test file
@@ -71,6 +74,19 @@ var allEnvVars = []string{
 const (
 	envKopiaCredentialsPath = "KOPIA_CREDENTIALS_PATH"
 	envKopiaConnectTimeout  = "KOPIA_CONNECT_TIMEOUT"
+
+	// Restic env-var names — separate set from the kopia equivalents
+	// because both backends may be present in the binary but only one
+	// is configured per deployment. AWS_* are shared (see allEnvVars).
+	envResticRepository      = "RESTIC_REPOSITORY"
+	envResticPassword        = "RESTIC_PASSWORD"
+	envResticCredentialsPath = "RESTIC_CREDENTIALS_PATH"
+	envResticConnectTimeout  = "RESTIC_CONNECT_TIMEOUT"
+	envResticCacheDir        = "RESTIC_CACHE_DIR"
+
+	// Restic-S3 fixture values used across the restic-s3 backend table.
+	testResticRepository = "s3:https://garage.lab.example/volsync-shared/restic"
+	testResticPassword   = "rp"
 )
 
 // snapshotEnv saves the current values of allEnvVars; restoreEnv puts them
@@ -656,6 +672,255 @@ func TestLoad_KopiaS3Backend_ConnectTimeoutOverride(t *testing.T) {
 			}
 			if cfg.KopiaConnectTimeout != tc.want {
 				t.Errorf("KopiaConnectTimeout = %v, want %v", cfg.KopiaConnectTimeout, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoad_ResticS3Backend exercises the restic-s3 backend path. Mirrors
+// TestLoad_KopiaS3Backend — restic encodes endpoint+bucket+tls choice
+// into one RESTIC_REPOSITORY URL, so the env surface is smaller.
+func TestLoad_ResticS3Backend(t *testing.T) {
+	saved := snapshotEnv()
+	t.Cleanup(func() { restoreEnv(saved) })
+
+	tests := []struct {
+		name           string
+		envVars        map[string]string
+		wantErr        bool
+		wantRepository string
+		wantAccess     string
+		wantSecret     string
+		wantPassword   string
+		wantCacheDir   string
+	}{
+		{
+			name: "valid restic-s3 with all env-var creds",
+			envVars: map[string]string{
+				envBackendType:        backend.TypeResticS3,
+				envResticRepository:   testResticRepository,
+				envAWSAccessKeyID:     testAccess,
+				envAWSSecretAccessKey: testSecret,
+				envResticPassword:     testResticPassword,
+			},
+			wantRepository: testResticRepository,
+			wantAccess:     testAccess,
+			wantSecret:     testSecret,
+			wantPassword:   testResticPassword,
+		},
+		{
+			name: "restic-s3 missing repository",
+			envVars: map[string]string{
+				envBackendType:        backend.TypeResticS3,
+				envAWSAccessKeyID:     testAccess,
+				envAWSSecretAccessKey: testSecret,
+				envResticPassword:     testResticPassword,
+			},
+			wantErr: true,
+		},
+		{
+			// Path-based-creds default lets all env-var creds be absent.
+			name: "restic-s3 missing all env-var creds (path-based default)",
+			envVars: map[string]string{
+				envBackendType:      backend.TypeResticS3,
+				envResticRepository: testResticRepository,
+			},
+			wantErr:        false,
+			wantRepository: testResticRepository,
+		},
+		{
+			name: "restic-s3 with cache dir set",
+			envVars: map[string]string{
+				envBackendType:      backend.TypeResticS3,
+				envResticRepository: testResticRepository,
+				envResticCacheDir:   "/var/cache/restic",
+			},
+			wantRepository: testResticRepository,
+			wantCacheDir:   "/var/cache/restic",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clearAllEnv()
+			for k, v := range tt.envVars {
+				_ = os.Setenv(k, v)
+			}
+
+			cfg, err := Load()
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("Load() error = nil, wantErr = true")
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("Load() unexpected error = %v", err)
+				return
+			}
+
+			if cfg.BackendType != backend.TypeResticS3 {
+				t.Errorf("BackendType = %v, want %v", cfg.BackendType, backend.TypeResticS3)
+			}
+			if cfg.ResticRepository != tt.wantRepository {
+				t.Errorf("ResticRepository = %v, want %v", cfg.ResticRepository, tt.wantRepository)
+			}
+			if cfg.ResticS3AccessKey != tt.wantAccess {
+				t.Errorf("ResticS3AccessKey = %v, want %v", cfg.ResticS3AccessKey, tt.wantAccess)
+			}
+			if cfg.ResticS3SecretKey != tt.wantSecret {
+				t.Errorf("ResticS3SecretKey = %v, want %v", cfg.ResticS3SecretKey, tt.wantSecret)
+			}
+			if cfg.ResticPassword != tt.wantPassword {
+				t.Errorf("ResticPassword = %v, want %v", cfg.ResticPassword, tt.wantPassword)
+			}
+			if cfg.ResticCacheDir != tt.wantCacheDir {
+				t.Errorf("ResticCacheDir = %v, want %v", cfg.ResticCacheDir, tt.wantCacheDir)
+			}
+		})
+	}
+}
+
+// TestLoad_ResticS3Backend_DefaultsCredentialsPath pins the default mount
+// path and connect-timeout. Mirrors the kopia equivalent.
+func TestLoad_ResticS3Backend_DefaultsCredentialsPath(t *testing.T) {
+	saved := snapshotEnv()
+	t.Cleanup(func() { restoreEnv(saved) })
+	clearAllEnv()
+
+	_ = os.Setenv(envBackendType, backend.TypeResticS3)
+	_ = os.Setenv(envResticRepository, testResticRepository)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.ResticCredentialsPath != "/var/secret/pvc-plumber-restic" {
+		t.Errorf("ResticCredentialsPath = %q, want %q", cfg.ResticCredentialsPath, "/var/secret/pvc-plumber-restic")
+	}
+	if cfg.ResticConnectTimeout != 60*time.Second {
+		t.Errorf("ResticConnectTimeout = %v, want 60s", cfg.ResticConnectTimeout)
+	}
+}
+
+// TestLoad_ResticS3Backend_PathlessRequiresEnvVarCreds pins the inverse:
+// when RESTIC_CREDENTIALS_PATH is explicitly emptied, the env-var trio
+// becomes required.
+func TestLoad_ResticS3Backend_PathlessRequiresEnvVarCreds(t *testing.T) {
+	saved := snapshotEnv()
+	t.Cleanup(func() { restoreEnv(saved) })
+
+	cases := []struct {
+		name       string
+		envVars    map[string]string
+		wantErrSub string
+	}{
+		{
+			name: "missing password",
+			envVars: map[string]string{
+				envBackendType:           backend.TypeResticS3,
+				envResticRepository:      testResticRepository,
+				envAWSAccessKeyID:        testAccess,
+				envAWSSecretAccessKey:    testSecret,
+				envResticCredentialsPath: "",
+			},
+			wantErrSub: "RESTIC_PASSWORD",
+		},
+		{
+			name: "missing access key",
+			envVars: map[string]string{
+				envBackendType:           backend.TypeResticS3,
+				envResticRepository:      testResticRepository,
+				envResticPassword:        testResticPassword,
+				envAWSSecretAccessKey:    testSecret,
+				envResticCredentialsPath: "",
+			},
+			wantErrSub: "AWS_ACCESS_KEY_ID",
+		},
+		{
+			name: "missing secret key",
+			envVars: map[string]string{
+				envBackendType:           backend.TypeResticS3,
+				envResticRepository:      testResticRepository,
+				envResticPassword:        testResticPassword,
+				envAWSAccessKeyID:        testAccess,
+				envResticCredentialsPath: "",
+			},
+			wantErrSub: "AWS_SECRET_ACCESS_KEY",
+		},
+		{
+			name: "all three present (env-var legacy shape)",
+			envVars: map[string]string{
+				envBackendType:           backend.TypeResticS3,
+				envResticRepository:      testResticRepository,
+				envResticPassword:        testResticPassword,
+				envAWSAccessKeyID:        testAccess,
+				envAWSSecretAccessKey:    testSecret,
+				envResticCredentialsPath: "",
+			},
+			wantErrSub: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clearAllEnv()
+			for k, v := range tc.envVars {
+				_ = os.Setenv(k, v)
+			}
+			_, err := Load()
+			if tc.wantErrSub == "" {
+				if err != nil {
+					t.Errorf("expected no error, got %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.wantErrSub)
+			}
+			if !contains(err.Error(), tc.wantErrSub) {
+				t.Errorf("error = %v, want substring %q", err, tc.wantErrSub)
+			}
+		})
+	}
+}
+
+// TestLoad_ResticS3Backend_ConnectTimeoutOverride pins the env-var
+// override path for RESTIC_CONNECT_TIMEOUT.
+func TestLoad_ResticS3Backend_ConnectTimeoutOverride(t *testing.T) {
+	saved := snapshotEnv()
+	t.Cleanup(func() { restoreEnv(saved) })
+
+	cases := []struct {
+		name    string
+		raw     string
+		wantErr bool
+		want    time.Duration
+	}{
+		{"explicit 30s", "30s", false, 30 * time.Second},
+		{"explicit 2m", "2m", false, 2 * time.Minute},
+		{"unparseable rejected", "garbage", true, 0},
+		{"zero rejected", "0s", true, 0},
+		{"negative rejected", "-5s", true, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clearAllEnv()
+			_ = os.Setenv(envBackendType, backend.TypeResticS3)
+			_ = os.Setenv(envResticRepository, testResticRepository)
+			_ = os.Setenv(envResticConnectTimeout, tc.raw)
+
+			cfg, err := Load()
+			if tc.wantErr {
+				if err == nil {
+					t.Errorf("expected error for %q, got nil", tc.raw)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.ResticConnectTimeout != tc.want {
+				t.Errorf("ResticConnectTimeout = %v, want %v", cfg.ResticConnectTimeout, tc.want)
 			}
 		})
 	}

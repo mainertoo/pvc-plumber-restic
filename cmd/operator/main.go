@@ -186,11 +186,12 @@ func main() {
 		return nil
 	})
 
-	// 2. Cache re-warm loop (kopia-s3 only). Identical cadence to the
-	//    legacy binary; ctx cancellation stops it within one tick.
-	if bundle.kopia != nil && cfg.ReWarmInterval > 0 {
+	// 2. Cache re-warm loop. Active for any backend exposing the
+	//    sourceLister contract (kopia-s3, restic-s3). Identical cadence
+	//    across backends; ctx cancellation stops it within one tick.
+	if bundle.lister != nil && cfg.ReWarmInterval > 0 {
 		g.Go(func() error {
-			runCacheReWarmLoop(gctx, bundle.kopia, bundle.cached, cfg.ReWarmInterval, slogger)
+			runCacheReWarmLoop(gctx, bundle.lister, bundle.cached, cfg.ReWarmInterval, slogger)
 			return nil
 		})
 	}

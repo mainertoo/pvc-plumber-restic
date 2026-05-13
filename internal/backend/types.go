@@ -1,10 +1,22 @@
 package backend
 
+import "context"
+
 const (
 	DecisionRestore = "restore"
 	DecisionFresh   = "fresh"
 	DecisionUnknown = "unknown"
 )
+
+// SourceLister is the cache-prewarm contract — any backend that can
+// enumerate `<ns>/<pvc>` keys implements this. Both kopia.Client and
+// restic.Client satisfy it; the s3 backend does not. The re-warm loop
+// in cmd/operator and cmd/pvc-plumber takes a SourceLister rather than
+// a typed backend client so the same loop drives every backend that
+// supports listing.
+type SourceLister interface {
+	ListAllSources(ctx context.Context) (map[string]bool, error)
+}
 
 // Backend type identifiers used in CheckResult.Backend and as the value of
 // the BACKEND_TYPE env var that selects the runtime backend implementation.

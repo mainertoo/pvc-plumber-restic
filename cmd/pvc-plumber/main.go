@@ -10,10 +10,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mitchross/pvc-plumber/internal/backend"
 	"github.com/mitchross/pvc-plumber/internal/cache"
 	"github.com/mitchross/pvc-plumber/internal/config"
 	"github.com/mitchross/pvc-plumber/internal/handler"
 	"github.com/mitchross/pvc-plumber/internal/kopia"
+	"github.com/mitchross/pvc-plumber/internal/restic"
 	"github.com/mitchross/pvc-plumber/internal/s3"
 )
 
@@ -55,7 +57,7 @@ func main() {
 	// Create backend based on configuration
 	var backendClient handler.BackendClient
 	switch cfg.BackendType {
-	case "s3":
+	case backend.TypeS3:
 		logger.Info("initializing s3 backend",
 			"endpoint", cfg.S3Endpoint,
 			"bucket", cfg.S3Bucket,
@@ -67,50 +69,67 @@ func main() {
 		}
 		backendClient = s3Client
 
-	case "kopia-s3":
+	case backend.TypeKopiaS3:
 		logger.Info("initializing kopia-s3 backend",
 			"endpoint", cfg.KopiaS3Endpoint,
 			"bucket", cfg.KopiaS3Bucket,
 			"disable_tls", cfg.KopiaS3DisableTLS,
 			"credentials_path", cfg.KopiaCredentialsPath,
 		)
-		// Same credentials-source selection as the operator binary —
-		// directory-mounted Secret when available, env-var-loaded creds as
-		// the fallback. The legacy HTTP-only deployment shape typically
-		// keeps env-var creds, so the static source path runs in production
-		// for v1.x callers; v3.1.0+ deployments use the dir source.
-		var creds kopia.CredentialsSource
+		var kCreds kopia.CredentialsSource
 		if cfg.KopiaCredentialsPath != "" {
-			creds = kopia.NewDirCredentialsSource(cfg.KopiaCredentialsPath)
+			kCreds = kopia.NewDirCredentialsSource(cfg.KopiaCredentialsPath)
 		} else {
-			creds = kopia.NewStaticCredentialsSource(cfg.KopiaPassword, cfg.KopiaS3AccessKey, cfg.KopiaS3SecretKey)
+			kCreds = kopia.NewStaticCredentialsSource(cfg.KopiaPassword, cfg.KopiaS3AccessKey, cfg.KopiaS3SecretKey)
 		}
 		kopiaClient := kopia.NewClient(kopia.S3Config{
 			Endpoint:   cfg.KopiaS3Endpoint,
 			Bucket:     cfg.KopiaS3Bucket,
 			DisableTLS: cfg.KopiaS3DisableTLS,
-		}, creds, logger, kopia.Options{ConnectTimeout: cfg.KopiaConnectTimeout})
+		}, kCreds, logger, kopia.Options{ConnectTimeout: cfg.KopiaConnectTimeout})
 		if err := kopiaClient.Connect(context.Background()); err != nil {
 			logger.Error("failed to connect to kopia repository", "error", err)
 			os.Exit(1)
 		}
 		backendClient = kopiaClient
+
+	case backend.TypeResticS3:
+		logger.Info("initializing restic-s3 backend",
+			"repository", cfg.ResticRepository,
+			"credentials_path", cfg.ResticCredentialsPath,
+			"connect_timeout", cfg.ResticConnectTimeout,
+			"cache_dir", cfg.ResticCacheDir,
+		)
+		var rCreds restic.CredentialsSource
+		if cfg.ResticCredentialsPath != "" {
+			rCreds = restic.NewDirCredentialsSource(cfg.ResticCredentialsPath)
+		} else {
+			rCreds = restic.NewStaticCredentialsSource(cfg.ResticPassword, cfg.ResticS3AccessKey, cfg.ResticS3SecretKey)
+		}
+		resticClient := restic.NewClient(restic.RepoConfig{
+			Repository: cfg.ResticRepository,
+			CacheDir:   cfg.ResticCacheDir,
+		}, rCreds, logger, restic.Options{ConnectTimeout: cfg.ResticConnectTimeout})
+		if err := resticClient.Connect(context.Background()); err != nil {
+			logger.Error("failed to connect to restic repository", "error", err)
+			os.Exit(1)
+		}
+		backendClient = resticClient
 	}
 
 	// Wrap backend with cache
 	cachedBackend := cache.New(backendClient, cfg.CacheTTL, logger)
 
-	// Pre-warm cache for kopia backend
-	var kopiaClient *kopia.Client
-	if cfg.BackendType == "kopia-s3" {
-		if kc, ok := backendClient.(*kopia.Client); ok {
-			kopiaClient = kc
-			sources, err := kc.ListAllSources(context.Background())
-			if err != nil {
-				logger.Warn("cache pre-warm failed, will populate on demand", "error", err)
-			} else {
-				cachedBackend.PreWarm(sources)
-			}
+	// Pre-warm cache for any backend exposing SourceLister (kopia-s3,
+	// restic-s3). Falls through to on-demand population for plain S3.
+	var lister backend.SourceLister
+	if sl, ok := backendClient.(backend.SourceLister); ok {
+		lister = sl
+		sources, err := sl.ListAllSources(context.Background())
+		if err != nil {
+			logger.Warn("cache pre-warm failed, will populate on demand", "error", err)
+		} else {
+			cachedBackend.PreWarm(sources)
 		}
 	}
 
@@ -145,14 +164,15 @@ func main() {
 		}
 	}()
 
-	// Periodic cache re-warm (kopia backend only). Each tick re-runs
-	// `kopia snapshot list --all` and rebuilds the cache so deleted
+	// Periodic cache re-warm. Active for any backend exposing
+	// SourceLister (kopia-s3, restic-s3). Each tick re-runs the
+	// backend's source listing and rebuilds the cache so deleted
 	// backups stop returning stale exists=true entries within one
 	// re-warm cycle instead of waiting for each entry's TTL to expire.
 	rwCtx, rwCancel := context.WithCancel(context.Background())
 	defer rwCancel()
-	if kopiaClient != nil && cfg.ReWarmInterval > 0 {
-		go runCacheReWarmLoop(rwCtx, kopiaClient, cachedBackend, cfg.ReWarmInterval, logger)
+	if lister != nil && cfg.ReWarmInterval > 0 {
+		go runCacheReWarmLoop(rwCtx, lister, cachedBackend, cfg.ReWarmInterval, logger)
 	}
 
 	// Wait for interrupt signal for graceful shutdown
@@ -175,13 +195,14 @@ func main() {
 	logger.Info("server stopped")
 }
 
-// runCacheReWarmLoop periodically re-runs kopia ListAllSources and
-// refreshes the cache. Returns when ctx is canceled (shutdown). Each
-// tick is bounded by a per-call timeout so a hung kopia subprocess
+// runCacheReWarmLoop periodically re-runs the backend's source listing
+// and refreshes the cache. Takes a SourceLister so the same loop drives
+// kopia-s3 and restic-s3 backends. Returns when ctx is canceled.
+// Each tick is bounded by a per-call timeout so a hung subprocess
 // can't pin the goroutine across multiple intervals.
 func runCacheReWarmLoop(
 	ctx context.Context,
-	kopiaClient *kopia.Client,
+	lister backend.SourceLister,
 	cachedBackend *cache.CachedClient,
 	interval time.Duration,
 	logger *slog.Logger,
@@ -190,8 +211,8 @@ func runCacheReWarmLoop(
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	// Bound each call to roughly one interval so a stuck `kopia snapshot
-	// list --all` can't keep the loop from progressing.
+	// Bound each call to roughly one interval so a stuck list subprocess
+	// can't keep the loop from progressing.
 	callTimeout := interval
 	if callTimeout > 60*time.Second {
 		callTimeout = 60 * time.Second
@@ -204,7 +225,7 @@ func runCacheReWarmLoop(
 			return
 		case <-ticker.C:
 			callCtx, cancel := context.WithTimeout(ctx, callTimeout)
-			sources, err := kopiaClient.ListAllSources(callCtx)
+			sources, err := lister.ListAllSources(callCtx)
 			cancel()
 			if err != nil {
 				logger.Warn("cache re-warm failed; keeping previous entries", "error", err)

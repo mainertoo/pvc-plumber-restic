@@ -73,6 +73,29 @@ type Config struct {
 	// the calling reconcile.
 	KopiaConnectTimeout time.Duration
 
+	// Restic (S3) backend settings. The restic backend talks to a single
+	// shared S3-backed repository identified by RESTIC_REPOSITORY (e.g.
+	// `s3:https://garage.lab.example/volsync-shared/restic`). Snapshots
+	// are queried by `<namespace>/<pvc>` tag — see internal/restic and
+	// docs/volsync-storage-recovery.md in the consuming GitOps repo.
+	//
+	// Like the kopia-s3 backend, credentials are loaded lazily from a
+	// directory-mounted Secret when ResticCredentialsPath is set; the
+	// env-var fallback (StaticCredentialsSource) is retained for legacy
+	// HTTP-only deployment shapes.
+	ResticRepository      string
+	ResticPassword        string
+	ResticS3AccessKey     string
+	ResticS3SecretKey     string
+	ResticCredentialsPath string
+	ResticConnectTimeout  time.Duration
+
+	// ResticCacheDir overrides restic's default cache location. Set when
+	// the deployment runs with readOnlyRootFilesystem and mounts an
+	// emptyDir for cache (Phase 1 finding: under runAsNonRoot=1000 the
+	// default `~/.cache` path fails with permission denied).
+	ResticCacheDir string
+
 	// ExternalSecret rendering knobs used by the PVC reconciler when it
 	// templates the per-PVC `volsync-<pvc>` ExternalSecret. Defaults pin to
 	// the reference cluster's 1Password Connect setup (vault item
@@ -92,9 +115,9 @@ func Load() (*Config, error) {
 	if backendType == "" {
 		backendType = backend.TypeS3
 	}
-	if backendType != backend.TypeS3 && backendType != backend.TypeKopiaS3 {
-		return nil, fmt.Errorf("invalid BACKEND_TYPE: %s (must be %q or %q)",
-			backendType, backend.TypeS3, backend.TypeKopiaS3)
+	if backendType != backend.TypeS3 && backendType != backend.TypeKopiaS3 && backendType != backend.TypeResticS3 {
+		return nil, fmt.Errorf("invalid BACKEND_TYPE: %s (must be %q, %q, or %q)",
+			backendType, backend.TypeS3, backend.TypeKopiaS3, backend.TypeResticS3)
 	}
 
 	httpTimeout := 3 * time.Second
@@ -154,6 +177,10 @@ func Load() (*Config, error) {
 		}
 	case backend.TypeKopiaS3:
 		if err := loadKopiaS3Config(cfg); err != nil {
+			return nil, err
+		}
+	case backend.TypeResticS3:
+		if err := loadResticS3Config(cfg); err != nil {
 			return nil, err
 		}
 	}
@@ -286,6 +313,71 @@ func loadKopiaS3Config(cfg *Config) error {
 		}
 		if cfg.KopiaS3SecretKey == "" {
 			return fmt.Errorf("AWS_SECRET_ACCESS_KEY is required for kopia-s3 backend when KOPIA_CREDENTIALS_PATH is empty")
+		}
+	}
+
+	return nil
+}
+
+// loadResticS3Config loads the env vars the operator's restic backend uses
+// to talk to the shared restic repository. RESTIC_REPOSITORY is the full
+// restic repo URL (e.g. `s3:https://garage.lab.example/volsync-shared/
+// restic`) — restic encodes endpoint, bucket, and tls choice into this
+// URL so there's no separate ENDPOINT / BUCKET / DISABLE_TLS triple.
+//
+// Credentials follow the same v3.1.0 pattern as the kopia backend:
+// RESTIC_CREDENTIALS_PATH (default `/var/secret/pvc-plumber-restic`)
+// points at a directory-mounted Secret with one file per key
+// (RESTIC_PASSWORD, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY). Setting
+// RESTIC_CREDENTIALS_PATH to the empty string disables the path loader
+// and requires the env-var trio.
+func loadResticS3Config(cfg *Config) error {
+	cfg.ResticRepository = os.Getenv("RESTIC_REPOSITORY")
+	if cfg.ResticRepository == "" {
+		return fmt.Errorf("RESTIC_REPOSITORY is required for restic-s3 backend")
+	}
+
+	cfg.ResticS3AccessKey = os.Getenv("AWS_ACCESS_KEY_ID")
+	cfg.ResticS3SecretKey = os.Getenv("AWS_SECRET_ACCESS_KEY")
+	cfg.ResticPassword = os.Getenv("RESTIC_PASSWORD")
+
+	if v, ok := os.LookupEnv("RESTIC_CREDENTIALS_PATH"); ok {
+		cfg.ResticCredentialsPath = v
+	} else {
+		cfg.ResticCredentialsPath = "/var/secret/pvc-plumber-restic"
+	}
+
+	cfg.ResticConnectTimeout = 60 * time.Second
+	if v := os.Getenv("RESTIC_CONNECT_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid RESTIC_CONNECT_TIMEOUT: %w", err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("RESTIC_CONNECT_TIMEOUT must be > 0, got %s", v)
+		}
+		cfg.ResticConnectTimeout = d
+	}
+
+	// RESTIC_CACHE_DIR is optional; empty value lets restic pick its
+	// default ($XDG_CACHE_HOME/restic, typically $HOME/.cache/restic).
+	// The deployment shape under runAsNonRoot=1000 with a read-only root
+	// FS must set this to a writable emptyDir mount or restic will fail.
+	cfg.ResticCacheDir = os.Getenv("RESTIC_CACHE_DIR")
+
+	// Either path-based creds OR env-var creds must be available — same
+	// rule as loadKopiaS3Config. The path default above is set
+	// unconditionally; we only trip an error if RESTIC_CREDENTIALS_PATH
+	// was explicitly set to empty AND the env-var trio is also incomplete.
+	if cfg.ResticCredentialsPath == "" {
+		if cfg.ResticPassword == "" {
+			return fmt.Errorf("RESTIC_PASSWORD is required for restic-s3 backend when RESTIC_CREDENTIALS_PATH is empty")
+		}
+		if cfg.ResticS3AccessKey == "" {
+			return fmt.Errorf("AWS_ACCESS_KEY_ID is required for restic-s3 backend when RESTIC_CREDENTIALS_PATH is empty")
+		}
+		if cfg.ResticS3SecretKey == "" {
+			return fmt.Errorf("AWS_SECRET_ACCESS_KEY is required for restic-s3 backend when RESTIC_CREDENTIALS_PATH is empty")
 		}
 	}
 
