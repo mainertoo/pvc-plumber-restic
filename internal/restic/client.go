@@ -263,8 +263,9 @@ func NewClientWithExecutor(cfg RepoConfig, creds CredentialsSource, logger *slog
 // c.sem is nil (MaxConcurrency <= 0), it falls through to a plain
 // executor.Run. Returns the context error if ctx is canceled while waiting
 // for a slot — same shape as a subprocess context cancellation, so callers
-// don't need to special-case "blocked on semaphore".
-func (c *Client) runRestic(ctx context.Context, env []string, name string, args ...string) ([]byte, error) {
+// don't need to special-case "blocked on semaphore". The binary name is
+// hardcoded `restic` since every call site invokes the restic CLI.
+func (c *Client) runRestic(ctx context.Context, env []string, args ...string) ([]byte, error) {
 	if c.sem != nil {
 		select {
 		case c.sem <- struct{}{}:
@@ -273,7 +274,7 @@ func (c *Client) runRestic(ctx context.Context, env []string, name string, args 
 		}
 		defer func() { <-c.sem }()
 	}
-	return c.executor.Run(ctx, env, name, args...)
+	return c.executor.Run(ctx, env, "restic", args...)
 }
 
 // envFor constructs the env slice for a restic subprocess. Always returns
@@ -345,7 +346,7 @@ func (c *Client) Connect(ctx context.Context) error {
 		)
 
 		env := c.envFor(creds)
-		output, err := c.runRestic(ctx, env, "restic", resticCmdCat, "config")
+		output, err := c.runRestic(ctx, env, resticCmdCat, "config")
 		if err != nil {
 			c.logger.Error("failed to probe restic repository", "error", err, "output", string(output))
 			return fmt.Errorf("failed to probe restic repository: %w", err)
@@ -395,7 +396,7 @@ func (c *Client) CheckBackupExists(ctx context.Context, namespace, pvc string) b
 	}
 
 	env := c.envFor(creds)
-	output, err := c.runRestic(ctx, env, "restic", resticCmdSnapshots, "--tag", tag, "--latest", "1", "--json")
+	output, err := c.runRestic(ctx, env, resticCmdSnapshots, "--tag", tag, "--latest", "1", "--json")
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
@@ -472,7 +473,7 @@ func (c *Client) ListAllSources(ctx context.Context) (map[string]bool, error) {
 		return nil, fmt.Errorf("load restic credentials: %w", err)
 	}
 	env := c.envFor(creds)
-	output, err := c.runRestic(ctx, env, "restic", resticCmdSnapshots, "--json")
+	output, err := c.runRestic(ctx, env, resticCmdSnapshots, "--json")
 	if err != nil {
 		return nil, fmt.Errorf("failed to list all snapshots: %w", err)
 	}
@@ -551,7 +552,7 @@ func (c *Client) HealthCheck(ctx context.Context) error {
 	}
 	env := c.envFor(creds)
 
-	if _, err := c.runRestic(probeCtx, env, "restic", resticCmdCat, "config"); err != nil {
+	if _, err := c.runRestic(probeCtx, env, resticCmdCat, "config"); err != nil {
 		return fmt.Errorf("restic cat config: %w", err)
 	}
 	return nil

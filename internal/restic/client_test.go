@@ -176,7 +176,7 @@ func TestRunRestic_SemaphoreLimitsConcurrency(t *testing.T) {
 	for i := 0; i < callers; i++ {
 		go func() {
 			defer wg.Done()
-			_, _ = client.runRestic(context.Background(), nil, "restic", "snapshots")
+			_, _ = client.runRestic(context.Background(), nil, "snapshots")
 		}()
 	}
 
@@ -211,7 +211,7 @@ func TestRunRestic_NoCapWhenMaxConcurrencyZero(t *testing.T) {
 	for i := 0; i < callers; i++ {
 		go func() {
 			defer wg.Done()
-			_, _ = client.runRestic(context.Background(), nil, "restic", "snapshots")
+			_, _ = client.runRestic(context.Background(), nil, "snapshots")
 		}()
 	}
 
