@@ -62,6 +62,20 @@ const (
 	resticCmdCat       = "cat"
 )
 
+// resticFlagNoLock skips lock acquisition for read-only operations.
+// Every restic invocation that takes a lock creates a file in the repo
+// that persists ~30 min before natural cleanup; under bursty admission
+// traffic (e.g. a Kyverno generate-rule force-recreate that touches
+// 40+ PVCs at once) the plumber accumulates hundreds of read locks
+// that then block downstream `restic forget` operations in the
+// volsync mover (which uses `--retry-lock 0s`). All four call sites
+// in this client are pure reads — snapshot listing for /exists,
+// snapshot listing for cache pre-warm, cat config for probes — so
+// the lock buys nothing and only creates contention. Worst case race
+// with a concurrent prune is "we read slightly stale snapshot data";
+// for admission decisions and cache warmup that's acceptable.
+const resticFlagNoLock = "--no-lock"
+
 // CredentialsSource hides where restic credentials come from. Mirrors
 // kopia.CredentialsSource — see that package's doc-comment for the
 // ESO-race motivation. Load is called on every subprocess invocation that
@@ -346,7 +360,7 @@ func (c *Client) Connect(ctx context.Context) error {
 		)
 
 		env := c.envFor(creds)
-		output, err := c.runRestic(ctx, env, resticCmdCat, "config")
+		output, err := c.runRestic(ctx, env, resticFlagNoLock, resticCmdCat, "config")
 		if err != nil {
 			c.logger.Error("failed to probe restic repository", "error", err, "output", string(output))
 			return fmt.Errorf("failed to probe restic repository: %w", err)
@@ -396,7 +410,7 @@ func (c *Client) CheckBackupExists(ctx context.Context, namespace, pvc string) b
 	}
 
 	env := c.envFor(creds)
-	output, err := c.runRestic(ctx, env, resticCmdSnapshots, "--tag", tag, "--latest", "1", "--json")
+	output, err := c.runRestic(ctx, env, resticFlagNoLock, resticCmdSnapshots, "--tag", tag, "--latest", "1", "--json")
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
@@ -473,7 +487,7 @@ func (c *Client) ListAllSources(ctx context.Context) (map[string]bool, error) {
 		return nil, fmt.Errorf("load restic credentials: %w", err)
 	}
 	env := c.envFor(creds)
-	output, err := c.runRestic(ctx, env, resticCmdSnapshots, "--json")
+	output, err := c.runRestic(ctx, env, resticFlagNoLock, resticCmdSnapshots, "--json")
 	if err != nil {
 		return nil, fmt.Errorf("failed to list all snapshots: %w", err)
 	}
@@ -552,7 +566,7 @@ func (c *Client) HealthCheck(ctx context.Context) error {
 	}
 	env := c.envFor(creds)
 
-	if _, err := c.runRestic(probeCtx, env, resticCmdCat, "config"); err != nil {
+	if _, err := c.runRestic(probeCtx, env, resticFlagNoLock, resticCmdCat, "config"); err != nil {
 		return fmt.Errorf("restic cat config: %w", err)
 	}
 	return nil

@@ -275,7 +275,7 @@ func TestConnect_Success(t *testing.T) {
 	if mock.lastName != "restic" {
 		t.Errorf("executor command = %q, want restic", mock.lastName)
 	}
-	wantArgs := []string{"cat", "config"}
+	wantArgs := []string{"--no-lock", "cat", "config"}
 	if !slices.Equal(mock.lastArgs, wantArgs) {
 		t.Errorf("executor args = %v, want %v", mock.lastArgs, wantArgs)
 	}
@@ -477,8 +477,9 @@ func TestCheckBackupExists_Found(t *testing.T) {
 	if result.Error != "" {
 		t.Errorf("Error = %v, want empty", result.Error)
 	}
-	// Pin the argv shape: snapshots --tag <ns>/<pvc> --latest 1 --json.
-	wantArgs := []string{cliSnapshots, "--tag", "karakeep/test-pvc", "--latest", "1", "--json"}
+	// Pin the argv shape: --no-lock snapshots --tag <ns>/<pvc> --latest 1 --json.
+	// --no-lock skips lock acquisition; see resticFlagNoLock doc-comment in client.go.
+	wantArgs := []string{"--no-lock", cliSnapshots, "--tag", "karakeep/test-pvc", "--latest", "1", "--json"}
 	if !slices.Equal(mock.lastArgs, wantArgs) {
 		t.Errorf("executor args = %v, want %v", mock.lastArgs, wantArgs)
 	}
@@ -681,9 +682,9 @@ func TestHealthCheck_Success(t *testing.T) {
 	if err := client.HealthCheck(context.Background()); err != nil {
 		t.Errorf("HealthCheck() error = %v, want nil", err)
 	}
-	wantArgs := []string{"cat", "config"}
+	wantArgs := []string{"--no-lock", "cat", "config"}
 	if !slices.Equal(mock.lastArgs, wantArgs) {
-		t.Errorf("HealthCheck must invoke `restic cat config`; got args %v", mock.lastArgs)
+		t.Errorf("HealthCheck must invoke `restic --no-lock cat config`; got args %v", mock.lastArgs)
 	}
 }
 
