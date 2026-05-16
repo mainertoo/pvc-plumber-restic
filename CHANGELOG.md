@@ -15,6 +15,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Oracle 503 storm under shared-repo concurrency (issue #1).** Under a
+  multi-source shared restic repo (20+ unique `<ns>/<pvc>` tags), every
+  cache re-warm cycle triggered a wave of `restic` subprocess SIGKILLs
+  and HTTP 503 responses from `/exists`. Root cause was a stack of tight
+  defaults that compounded under any concurrent load — none of them
+  memory-related. Four-part fix:
+  - **`HTTP_TIMEOUT` default 3s → 30s.** 3s was unrealistic for
+    `restic snapshots --tag` against any non-trivial repo. The `/exists`
+    handler now bounds the request context generously enough that a
+    slow-but-healthy subprocess finishes instead of being SIGKILLed via
+    context cancellation.
+  - **`HealthCheck` inner timeout configurable.** Was hardcoded 5s in
+    `internal/restic/Client.HealthCheck` independent of the probe's
+    `timeoutSeconds`. New env var `HEALTH_CHECK_TIMEOUT` (default 15s)
+    controls it; the readiness probe also routes through the new
+    semaphore so it cannot starve real `/exists` work.
+  - **`CACHE_TTL` defaults to `RE_WARM_INTERVAL`.** Previously a fixed
+    60s, which left a multi-minute gap when `RE_WARM_INTERVAL` was
+    overridden to several minutes; every `/exists` call in that gap
+    missed cache and stampeded the backend. Explicit `CACHE_TTL` still
+    overrides.
+  - **Global semaphore on restic subprocesses.** New env var
+    `RESTIC_MAX_CONCURRENCY` (default 2) caps in-flight `restic` calls
+    across `CheckBackupExists`, `ListAllSources`, `HealthCheck`, and
+    `Connect`. Eliminates the thundering-herd that triggered the
+    cascading timeouts. 0 disables the cap entirely (legacy behavior).
+- **Cosmetic: synthesized cache entries reported wrong backend type.**
+  `internal/cache/buildEntry` hardcoded `Backend: TypeKopiaS3` and the
+  kopia-shaped Source string, so restic `/exists` cache hits returned
+  `backend: "kopia-s3", source: "<pvc>-backup@<ns>:/data"` even though
+  the underlying backend was `restic-s3`. Now matches the actual
+  backend: restic returns the bare `<ns>/<pvc>` tag as Source.
+
+### Added
+
+- `HEALTH_CHECK_TIMEOUT` env var (default `15s`) — bounds the readiness
+  probe's inner `restic cat config` call.
+- `RESTIC_MAX_CONCURRENCY` env var (default `2`) — caps concurrent
+  `restic` subprocesses across all call sites. Set to `0` to disable.
+
+### Changed
+
+- `HTTP_TIMEOUT` default raised from `3s` to `30s`.
+- `CACHE_TTL` default is now `RE_WARM_INTERVAL` (was fixed `60s`). Falls
+  back to `60s` when `RE_WARM_INTERVAL` is unset or zero.
+- `cache.New` signature gained a `backendType string` parameter so
+  synthesized entries match the actual backend's `Backend`/`Source`
+  shape. Existing callers in `cmd/pvc-plumber` and `cmd/operator` pass
+  `cfg.BackendType`.
+- `restic.Options` gained `HealthCheckTimeout` and `MaxConcurrency`
+  fields. Both default sanely when zero.
+
 ## [3.1.0] — 2026-05-08
 
 > **Bugfix release on top of v3.0.0.** Resolves the v3.0.0 cutover incident

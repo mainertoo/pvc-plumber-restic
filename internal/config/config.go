@@ -18,12 +18,21 @@ const (
 
 type Config struct {
 	// Common settings
-	BackendType    string
-	HTTPTimeout    time.Duration
-	CacheTTL       time.Duration
-	ReWarmInterval time.Duration // 0 disables the periodic re-warm loop
-	Port           string
-	LogLevel       string
+	BackendType        string
+	HTTPTimeout        time.Duration
+	HealthCheckTimeout time.Duration
+	CacheTTL           time.Duration
+	ReWarmInterval     time.Duration // 0 disables the periodic re-warm loop
+	Port               string
+	LogLevel           string
+
+	// ResticMaxConcurrency caps in-flight `restic` subprocesses. All call
+	// sites (CheckBackupExists, ListAllSources, HealthCheck, Connect)
+	// acquire from a shared semaphore before exec. 0 means uncapped. The
+	// motivation is shared-repo lock contention: many concurrent
+	// `restic snapshots --tag` calls queue on repo locks long enough to
+	// trip HTTP_TIMEOUT and SIGKILL each other (issue #1 — 503 storm).
+	ResticMaxConcurrency int
 
 	// S3 backend settings
 	S3Endpoint  string
@@ -120,7 +129,12 @@ func Load() (*Config, error) {
 			backendType, backend.TypeS3, backend.TypeKopiaS3, backend.TypeResticS3)
 	}
 
-	httpTimeout := 3 * time.Second
+	// HTTP_TIMEOUT bounds the /exists request context. 3s was the v3.x
+	// default; against a multi-source shared restic repo a single
+	// `restic snapshots --tag` regularly takes longer than that under any
+	// contention. 30s gives plenty of headroom while still bailing on a
+	// truly wedged subprocess. See issue #1.
+	httpTimeout := 30 * time.Second
 	if timeoutStr := os.Getenv("HTTP_TIMEOUT"); timeoutStr != "" {
 		duration, err := time.ParseDuration(timeoutStr)
 		if err != nil {
@@ -129,13 +143,20 @@ func Load() (*Config, error) {
 		httpTimeout = duration
 	}
 
-	cacheTTL := 60 * time.Second
-	if ttlStr := os.Getenv("CACHE_TTL"); ttlStr != "" {
-		duration, err := time.ParseDuration(ttlStr)
+	// HEALTH_CHECK_TIMEOUT bounds the readiness probe's inner restic call
+	// (was hardcoded 5s in client.go prior to issue #1). 15s default
+	// matches the slowest healthy `restic cat config` we've seen under
+	// load, with 10s slack.
+	healthCheckTimeout := 15 * time.Second
+	if timeoutStr := os.Getenv("HEALTH_CHECK_TIMEOUT"); timeoutStr != "" {
+		duration, err := time.ParseDuration(timeoutStr)
 		if err != nil {
-			return nil, fmt.Errorf("invalid CACHE_TTL: %w", err)
+			return nil, fmt.Errorf("invalid HEALTH_CHECK_TIMEOUT: %w", err)
 		}
-		cacheTTL = duration
+		if duration <= 0 {
+			return nil, fmt.Errorf("HEALTH_CHECK_TIMEOUT must be > 0, got %s", timeoutStr)
+		}
+		healthCheckTimeout = duration
 	}
 
 	reWarmInterval := 90 * time.Second
@@ -150,6 +171,41 @@ func Load() (*Config, error) {
 		reWarmInterval = duration
 	}
 
+	// CACHE_TTL defaults to RE_WARM_INTERVAL so cache entries stay valid
+	// between re-warms. Prior default was a fixed 60s which left a long
+	// gap when RE_WARM_INTERVAL was overridden to several minutes — every
+	// /exists call in that gap missed cache and stampeded the backend
+	// (issue #1). Explicit CACHE_TTL still overrides; setting it shorter
+	// than RE_WARM_INTERVAL is supported but discouraged.
+	cacheTTL := reWarmInterval
+	if cacheTTL == 0 {
+		cacheTTL = 60 * time.Second
+	}
+	if ttlStr, ok := os.LookupEnv("CACHE_TTL"); ok {
+		duration, err := time.ParseDuration(ttlStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid CACHE_TTL: %w", err)
+		}
+		cacheTTL = duration
+	}
+
+	// RESTIC_MAX_CONCURRENCY caps in-flight restic subprocesses. Default
+	// 2 lets the readiness probe and a /exists call coexist without the
+	// cache re-warm starving them, while still throttling thundering
+	// herds. 0 disables the cap entirely (legacy behavior, not
+	// recommended on a shared repo).
+	resticMaxConcurrency := 2
+	if maxStr := os.Getenv("RESTIC_MAX_CONCURRENCY"); maxStr != "" {
+		n, err := strconv.Atoi(maxStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid RESTIC_MAX_CONCURRENCY: %w", err)
+		}
+		if n < 0 {
+			return nil, fmt.Errorf("RESTIC_MAX_CONCURRENCY must be >= 0, got %s", maxStr)
+		}
+		resticMaxConcurrency = n
+	}
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = defaultPort
@@ -161,12 +217,14 @@ func Load() (*Config, error) {
 	}
 
 	cfg := &Config{
-		BackendType:    backendType,
-		HTTPTimeout:    httpTimeout,
-		CacheTTL:       cacheTTL,
-		ReWarmInterval: reWarmInterval,
-		Port:           port,
-		LogLevel:       logLevel,
+		BackendType:          backendType,
+		HTTPTimeout:          httpTimeout,
+		HealthCheckTimeout:   healthCheckTimeout,
+		CacheTTL:             cacheTTL,
+		ReWarmInterval:       reWarmInterval,
+		Port:                 port,
+		LogLevel:             logLevel,
+		ResticMaxConcurrency: resticMaxConcurrency,
 	}
 
 	// Backend-specific validation

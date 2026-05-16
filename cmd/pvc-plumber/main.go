@@ -109,7 +109,11 @@ func main() {
 		resticClient := restic.NewClient(restic.RepoConfig{
 			Repository: cfg.ResticRepository,
 			CacheDir:   cfg.ResticCacheDir,
-		}, rCreds, logger, restic.Options{ConnectTimeout: cfg.ResticConnectTimeout})
+		}, rCreds, logger, restic.Options{
+			ConnectTimeout:     cfg.ResticConnectTimeout,
+			HealthCheckTimeout: cfg.HealthCheckTimeout,
+			MaxConcurrency:     cfg.ResticMaxConcurrency,
+		})
 		if err := resticClient.Connect(context.Background()); err != nil {
 			logger.Error("failed to connect to restic repository", "error", err)
 			os.Exit(1)
@@ -118,7 +122,7 @@ func main() {
 	}
 
 	// Wrap backend with cache
-	cachedBackend := cache.New(backendClient, cfg.CacheTTL, logger)
+	cachedBackend := cache.New(backendClient, cfg.CacheTTL, logger, cfg.BackendType)
 
 	// Pre-warm cache for any backend exposing SourceLister (kopia-s3,
 	// restic-s3). Falls through to on-demand population for plain S3.

@@ -180,11 +180,19 @@ type RepoConfig struct {
 // via ESO is observed without a pod restart and a Secret that hasn't
 // rendered yet doesn't crash the pod at startup.
 type Client struct {
-	cfg            RepoConfig
-	creds          CredentialsSource
-	connectTimeout time.Duration
-	logger         *slog.Logger
-	executor       CommandExecutor
+	cfg                RepoConfig
+	creds              CredentialsSource
+	connectTimeout     time.Duration
+	healthCheckTimeout time.Duration
+	logger             *slog.Logger
+	executor           CommandExecutor
+
+	// sem caps in-flight restic subprocesses across all call sites
+	// (CheckBackupExists, ListAllSources, HealthCheck, Connect). Nil
+	// when MaxConcurrency <= 0 (legacy uncapped behavior). See issue #1
+	// — without this cap, concurrent calls queue on repo locks long
+	// enough to trip request timeouts and SIGKILL each other.
+	sem chan struct{}
 
 	// connected is set true once Connect() has succeeded. HealthCheck
 	// requires this before it spawns `restic cat config` — there's no
@@ -194,15 +202,25 @@ type Client struct {
 }
 
 // Options bundles the optional knobs NewClient accepts so the constructor
-// surface stays small as we add more (connect timeout, future health-check
-// timeout, …). All fields have sane defaults; supply zero values to keep
-// them.
+// surface stays small as we add more (connect timeout, health-check timeout,
+// concurrency cap). All fields have sane defaults; supply zero values to
+// keep them.
 type Options struct {
 	// ConnectTimeout caps the total time Connect() spends retrying on
 	// ErrCredentialsNotReady. Defaults to 60s when zero. After this
 	// elapses without seeing ready credentials, Connect returns an
 	// error and the caller (controller-runtime) is expected to re-queue.
 	ConnectTimeout time.Duration
+
+	// HealthCheckTimeout bounds the readiness probe's inner `restic cat
+	// config` call. Defaults to 15s when zero. Was hardcoded 5s prior to
+	// issue #1, which was too tight under cache re-warm contention.
+	HealthCheckTimeout time.Duration
+
+	// MaxConcurrency caps in-flight restic subprocesses. 0 or negative
+	// disables the cap (legacy uncapped behavior). 2 is a reasonable
+	// default for shared-repo deployments.
+	MaxConcurrency int
 }
 
 // NewClient creates a new restic client. creds may be nil for tests that
@@ -213,12 +231,22 @@ func NewClient(cfg RepoConfig, creds CredentialsSource, logger *slog.Logger, opt
 	if connectTimeout <= 0 {
 		connectTimeout = 60 * time.Second
 	}
+	healthCheckTimeout := opts.HealthCheckTimeout
+	if healthCheckTimeout <= 0 {
+		healthCheckTimeout = 15 * time.Second
+	}
+	var sem chan struct{}
+	if opts.MaxConcurrency > 0 {
+		sem = make(chan struct{}, opts.MaxConcurrency)
+	}
 	return &Client{
-		cfg:            cfg,
-		creds:          creds,
-		connectTimeout: connectTimeout,
-		logger:         logger,
-		executor:       &RealExecutor{},
+		cfg:                cfg,
+		creds:              creds,
+		connectTimeout:     connectTimeout,
+		healthCheckTimeout: healthCheckTimeout,
+		logger:             logger,
+		executor:           &RealExecutor{},
+		sem:                sem,
 	}
 }
 
@@ -228,6 +256,24 @@ func NewClientWithExecutor(cfg RepoConfig, creds CredentialsSource, logger *slog
 	c := NewClient(cfg, creds, logger, opts)
 	c.executor = executor
 	return c
+}
+
+// runRestic gates `c.executor.Run` through the in-flight semaphore so the
+// number of concurrent `restic` subprocesses never exceeds the cap. When
+// c.sem is nil (MaxConcurrency <= 0), it falls through to a plain
+// executor.Run. Returns the context error if ctx is canceled while waiting
+// for a slot — same shape as a subprocess context cancellation, so callers
+// don't need to special-case "blocked on semaphore".
+func (c *Client) runRestic(ctx context.Context, env []string, name string, args ...string) ([]byte, error) {
+	if c.sem != nil {
+		select {
+		case c.sem <- struct{}{}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		defer func() { <-c.sem }()
+	}
+	return c.executor.Run(ctx, env, name, args...)
 }
 
 // envFor constructs the env slice for a restic subprocess. Always returns
@@ -299,7 +345,7 @@ func (c *Client) Connect(ctx context.Context) error {
 		)
 
 		env := c.envFor(creds)
-		output, err := c.executor.Run(ctx, env, "restic", resticCmdCat, "config")
+		output, err := c.runRestic(ctx, env, "restic", resticCmdCat, "config")
 		if err != nil {
 			c.logger.Error("failed to probe restic repository", "error", err, "output", string(output))
 			return fmt.Errorf("failed to probe restic repository: %w", err)
@@ -349,7 +395,7 @@ func (c *Client) CheckBackupExists(ctx context.Context, namespace, pvc string) b
 	}
 
 	env := c.envFor(creds)
-	output, err := c.executor.Run(ctx, env, "restic", resticCmdSnapshots, "--tag", tag, "--latest", "1", "--json")
+	output, err := c.runRestic(ctx, env, "restic", resticCmdSnapshots, "--tag", tag, "--latest", "1", "--json")
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
@@ -426,7 +472,7 @@ func (c *Client) ListAllSources(ctx context.Context) (map[string]bool, error) {
 		return nil, fmt.Errorf("load restic credentials: %w", err)
 	}
 	env := c.envFor(creds)
-	output, err := c.executor.Run(ctx, env, "restic", resticCmdSnapshots, "--json")
+	output, err := c.runRestic(ctx, env, "restic", resticCmdSnapshots, "--json")
 	if err != nil {
 		return nil, fmt.Errorf("failed to list all snapshots: %w", err)
 	}
@@ -483,9 +529,11 @@ func (c *Client) IsConnected() bool {
 //
 // `restic cat config` is the cheapest call that proves repo access —
 // reads exactly one object (the encrypted config blob), doesn't list
-// snapshots, doesn't touch the cache. Bounded by a 5s timeout independent
-// of the caller's ctx so a wedged endpoint can't pin the readiness path
-// past the kubelet probe budget.
+// snapshots, doesn't touch the cache. Bounded by c.healthCheckTimeout
+// (env HEALTH_CHECK_TIMEOUT, default 15s) independent of the caller's ctx
+// so a wedged endpoint can't pin the readiness path past the kubelet probe
+// budget. Goes through the same semaphore as other restic ops so the probe
+// can't starve real /exists work.
 func (c *Client) HealthCheck(ctx context.Context) error {
 	c.mu.RLock()
 	connected := c.connected
@@ -494,8 +542,7 @@ func (c *Client) HealthCheck(ctx context.Context) error {
 		return fmt.Errorf("restic repository not connected")
 	}
 
-	const statusTimeout = 5 * time.Second
-	probeCtx, cancel := context.WithTimeout(ctx, statusTimeout)
+	probeCtx, cancel := context.WithTimeout(ctx, c.healthCheckTimeout)
 	defer cancel()
 
 	creds, err := c.creds.Load()
@@ -504,7 +551,7 @@ func (c *Client) HealthCheck(ctx context.Context) error {
 	}
 	env := c.envFor(creds)
 
-	if _, err := c.executor.Run(probeCtx, env, "restic", resticCmdCat, "config"); err != nil {
+	if _, err := c.runRestic(probeCtx, env, "restic", resticCmdCat, "config"); err != nil {
 		return fmt.Errorf("restic cat config: %w", err)
 	}
 	return nil

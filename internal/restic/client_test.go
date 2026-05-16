@@ -98,6 +98,39 @@ func TestNewClient_OptionsConnectTimeoutOverride(t *testing.T) {
 	}
 }
 
+// TestNewClient_OptionsHealthCheckTimeout pins the new HealthCheckTimeout
+// knob (issue #1) — zero defaults to 15s, explicit values pass through.
+func TestNewClient_OptionsHealthCheckTimeout(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	def := NewClient(testRepoConfig(), testCreds(), logger, Options{})
+	if def.healthCheckTimeout != 15*time.Second {
+		t.Errorf("default healthCheckTimeout = %v, want 15s", def.healthCheckTimeout)
+	}
+
+	override := NewClient(testRepoConfig(), testCreds(), logger, Options{HealthCheckTimeout: 7 * time.Second})
+	if override.healthCheckTimeout != 7*time.Second {
+		t.Errorf("override healthCheckTimeout = %v, want 7s", override.healthCheckTimeout)
+	}
+}
+
+// TestNewClient_MaxConcurrencySemaphore pins that the concurrency cap
+// allocates a buffered channel sized to the option (issue #1). Zero or
+// negative leaves the cap disabled (nil sem -> uncapped legacy behavior).
+func TestNewClient_MaxConcurrencySemaphore(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	uncapped := NewClient(testRepoConfig(), testCreds(), logger, Options{})
+	if uncapped.sem != nil {
+		t.Errorf("default MaxConcurrency should leave sem nil (uncapped), got %d cap", cap(uncapped.sem))
+	}
+
+	capped := NewClient(testRepoConfig(), testCreds(), logger, Options{MaxConcurrency: 3})
+	if capped.sem == nil || cap(capped.sem) != 3 {
+		t.Errorf("MaxConcurrency=3 should make sem with cap 3, got %v", capped.sem)
+	}
+}
+
 // TestConnect_Success pins the probe shape: `restic cat config` plus all
 // four env vars populated. The probe must NOT pass credentials on argv
 // (would leak password into ps output).
