@@ -357,9 +357,12 @@ All configuration is done via environment variables.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `BACKEND_TYPE` | No | `s3` | Backend type: `s3` or `kopia-s3` |
-| `HTTP_TIMEOUT` | No | `3s` | Per-request backend timeout for `/exists` checks (e.g., `5s`, `500ms`) |
-| `CACHE_TTL` | No | `60s` | Cache TTL for backup existence checks (e.g., `30s`, `2m`) |
+| `BACKEND_TYPE` | No | `s3` | Backend type: `s3`, `kopia-s3`, or `restic-s3` |
+| `HTTP_TIMEOUT` | No | `30s` | Per-request backend timeout for `/exists` checks (e.g., `5s`, `500ms`). Raised from `3s` in the issue #1 fix — 3s was too tight for `restic snapshots --tag` on multi-source repos. |
+| `CACHE_TTL` | No | `RE_WARM_INTERVAL` (falls back to `60s` when re-warm is disabled) | Cache TTL for backup existence checks (e.g., `30s`, `2m`). Default tracks `RE_WARM_INTERVAL` so cache entries don't expire between re-warms. Explicit values still override. |
+| `RE_WARM_INTERVAL` | No | `90s` | How often the cache scans the backend for new/removed sources. Set to `0` to disable the periodic re-warm loop. |
+| `HEALTH_CHECK_TIMEOUT` | No | `15s` | Bounds the readiness probe's inner `restic cat config` call (restic-s3 backend only). Was hardcoded 5s prior to issue #1. |
+| `RESTIC_MAX_CONCURRENCY` | No | `2` | Caps in-flight `restic` subprocesses across all call sites (restic-s3 backend only). `0` disables the cap (legacy uncapped behavior — not recommended on shared repos). |
 | `PORT` | No | `8080` | HTTP server port |
 | `LOG_LEVEL` | No | `info` | Log level: `debug`, `info`, `warn`, `error` |
 

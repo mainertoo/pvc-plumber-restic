@@ -43,12 +43,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     across `CheckBackupExists`, `ListAllSources`, `HealthCheck`, and
     `Connect`. Eliminates the thundering-herd that triggered the
     cascading timeouts. 0 disables the cap entirely (legacy behavior).
-- **Cosmetic: synthesized cache entries reported wrong backend type.**
+- **Synthesized cache entries reported wrong backend type (response-shape change).**
   `internal/cache/buildEntry` hardcoded `Backend: TypeKopiaS3` and the
   kopia-shaped Source string, so restic `/exists` cache hits returned
   `backend: "kopia-s3", source: "<pvc>-backup@<ns>:/data"` even though
   the underlying backend was `restic-s3`. Now matches the actual
-  backend: restic returns the bare `<ns>/<pvc>` tag as Source.
+  backend: restic returns the bare `<ns>/<pvc>` tag as Source. **This
+  changes the wire format for restic-backend cache-hit responses** —
+  any consumer parsing the `backend` or `source` field of `/exists`
+  output will see the corrected (truthful) values. Cache-miss responses
+  already returned the correct shape because they came from the backend
+  directly; only the synthesized PreWarm/Refresh entries were affected.
 
 ### Added
 
