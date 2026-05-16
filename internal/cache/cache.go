@@ -24,11 +24,12 @@ type entry struct {
 
 // CachedClient wraps a backend with an in-memory TTL cache.
 type CachedClient struct {
-	inner  BackendClient
-	ttl    time.Duration
-	logger *slog.Logger
-	mu     sync.RWMutex
-	items  map[string]entry
+	inner       BackendClient
+	ttl         time.Duration
+	backendType string
+	logger      *slog.Logger
+	mu          sync.RWMutex
+	items       map[string]entry
 
 	// sf deduplicates concurrent cache-miss lookups for the same key.
 	// Kyverno issues 3 admission calls per PVC (one mutate, two validate),
@@ -39,13 +40,22 @@ type CachedClient struct {
 	dedupedCalls atomic.Int64
 }
 
-// New creates a cached wrapper around a backend client.
-func New(inner BackendClient, ttl time.Duration, logger *slog.Logger) *CachedClient {
+// New creates a cached wrapper around a backend client. backendType
+// determines how synthesized cache entries (from PreWarm / Refresh, which
+// only have the ns/pvc key, not a full CheckResult) format their Source
+// and Backend fields so the response shape matches the underlying
+// backend. Empty string preserves the historical default of TypeKopiaS3 +
+// kopia-style source for backward compatibility.
+func New(inner BackendClient, ttl time.Duration, logger *slog.Logger, backendType string) *CachedClient {
+	if backendType == "" {
+		backendType = backend.TypeKopiaS3
+	}
 	return &CachedClient{
-		inner:  inner,
-		ttl:    ttl,
-		logger: logger,
-		items:  make(map[string]entry),
+		inner:       inner,
+		ttl:         ttl,
+		backendType: backendType,
+		logger:      logger,
+		items:       make(map[string]entry),
 	}
 }
 
@@ -67,7 +77,7 @@ func (c *CachedClient) PreWarm(sources map[string]bool) {
 
 	expiry := time.Now().Add(c.ttl)
 	for key, exists := range sources {
-		if e, ok := buildEntry(key, exists, expiry); ok {
+		if e, ok := buildEntry(key, exists, expiry, c.backendType); ok {
 			c.items[key] = e
 		}
 	}
@@ -83,7 +93,7 @@ func (c *CachedClient) Refresh(sources map[string]bool) {
 	expiry := time.Now().Add(c.ttl)
 	newItems := make(map[string]entry, len(sources))
 	for key, exists := range sources {
-		if e, ok := buildEntry(key, exists, expiry); ok {
+		if e, ok := buildEntry(key, exists, expiry, c.backendType); ok {
 			newItems[key] = e
 		}
 	}
@@ -97,8 +107,11 @@ func (c *CachedClient) Refresh(sources map[string]bool) {
 
 // buildEntry parses a "namespace/pvc" key and constructs a cache entry.
 // Returns (entry, true) on success, or (zero, false) when the key is
-// malformed (missing slash, empty namespace, or empty pvc).
-func buildEntry(key string, exists bool, expiry time.Time) (entry, bool) {
+// malformed (missing slash, empty namespace, or empty pvc). The source
+// string format matches what the underlying backend would return for the
+// same key — kopia uses the `<pvc>-backup@<ns>:/data` policy-source shape,
+// restic uses the bare `<ns>/<pvc>` tag.
+func buildEntry(key string, exists bool, expiry time.Time, backendType string) (entry, bool) {
 	var namespace, pvc string
 	for i := 0; i < len(key); i++ {
 		if key[i] == '/' {
@@ -110,6 +123,10 @@ func buildEntry(key string, exists bool, expiry time.Time) (entry, bool) {
 	if namespace == "" || pvc == "" {
 		return entry{}, false
 	}
+	source := key
+	if backendType == backend.TypeKopiaS3 {
+		source = pvc + "-backup@" + namespace + ":/data"
+	}
 	return entry{
 		result: backend.CheckResult{
 			Exists:        exists,
@@ -117,8 +134,8 @@ func buildEntry(key string, exists bool, expiry time.Time) (entry, bool) {
 			Authoritative: true,
 			Namespace:     namespace,
 			Pvc:           pvc,
-			Backend:       backend.TypeKopiaS3,
-			Source:        pvc + "-backup@" + namespace + ":/data",
+			Backend:       backendType,
+			Source:        source,
 		},
 		expiresAt: expiry,
 	}, true

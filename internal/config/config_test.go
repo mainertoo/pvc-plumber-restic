@@ -181,7 +181,7 @@ func TestLoad_S3Backend(t *testing.T) {
 			wantAccess:   testAccess,
 			wantSecret:   testSecret,
 			wantSecure:   false,
-			wantTimeout:  3 * time.Second,
+			wantTimeout:  30 * time.Second,
 			wantPort:     "8080",
 			wantLogLevel: testLogInfo,
 		},

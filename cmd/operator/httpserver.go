@@ -109,7 +109,11 @@ func buildBackend(ctx context.Context, cfg *config.Config, logger *slog.Logger) 
 		rc := restic.NewClient(restic.RepoConfig{
 			Repository: cfg.ResticRepository,
 			CacheDir:   cfg.ResticCacheDir,
-		}, creds, logger, restic.Options{ConnectTimeout: cfg.ResticConnectTimeout})
+		}, creds, logger, restic.Options{
+			ConnectTimeout:     cfg.ResticConnectTimeout,
+			HealthCheckTimeout: cfg.HealthCheckTimeout,
+			MaxConcurrency:     cfg.ResticMaxConcurrency,
+		})
 		if err := rc.Connect(ctx); err != nil {
 			return nil, fmt.Errorf("connect to restic repository: %w", err)
 		}
@@ -120,7 +124,7 @@ func buildBackend(ctx context.Context, cfg *config.Config, logger *slog.Logger) 
 		return nil, fmt.Errorf("invalid BACKEND_TYPE: %s", cfg.BackendType)
 	}
 
-	cachedBackend := cache.New(backendClient, cfg.CacheTTL, logger)
+	cachedBackend := cache.New(backendClient, cfg.CacheTTL, logger, cfg.BackendType)
 
 	// Pre-warm only on backends that can enumerate sources (kopia-s3,
 	// restic-s3). Failure is non-fatal — the cache populates on demand.

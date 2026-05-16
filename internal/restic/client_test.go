@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -96,6 +97,161 @@ func TestNewClient_OptionsConnectTimeoutOverride(t *testing.T) {
 	if client.connectTimeout != 5*time.Second {
 		t.Errorf("connectTimeout = %v, want 5s", client.connectTimeout)
 	}
+}
+
+// TestNewClient_OptionsHealthCheckTimeout pins the new HealthCheckTimeout
+// knob (issue #1) — zero defaults to 15s, explicit values pass through.
+func TestNewClient_OptionsHealthCheckTimeout(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	def := NewClient(testRepoConfig(), testCreds(), logger, Options{})
+	if def.healthCheckTimeout != 15*time.Second {
+		t.Errorf("default healthCheckTimeout = %v, want 15s", def.healthCheckTimeout)
+	}
+
+	override := NewClient(testRepoConfig(), testCreds(), logger, Options{HealthCheckTimeout: 7 * time.Second})
+	if override.healthCheckTimeout != 7*time.Second {
+		t.Errorf("override healthCheckTimeout = %v, want 7s", override.healthCheckTimeout)
+	}
+}
+
+// TestNewClient_MaxConcurrencySemaphore pins that the concurrency cap
+// allocates a buffered channel sized to the option (issue #1). Zero or
+// negative leaves the cap disabled (nil sem -> uncapped legacy behavior).
+func TestNewClient_MaxConcurrencySemaphore(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	uncapped := NewClient(testRepoConfig(), testCreds(), logger, Options{})
+	if uncapped.sem != nil {
+		t.Errorf("default MaxConcurrency should leave sem nil (uncapped), got %d cap", cap(uncapped.sem))
+	}
+
+	capped := NewClient(testRepoConfig(), testCreds(), logger, Options{MaxConcurrency: 3})
+	if capped.sem == nil || cap(capped.sem) != 3 {
+		t.Errorf("MaxConcurrency=3 should make sem with cap 3, got %v", capped.sem)
+	}
+}
+
+// gatedExecutor is a CommandExecutor whose Run blocks on `release` and
+// tracks the peak number of concurrent in-flight calls. Used to prove the
+// semaphore actually limits concurrency rather than just allocating the
+// channel.
+type gatedExecutor struct {
+	release  chan struct{}
+	inFlight atomic.Int32
+	peak     atomic.Int32
+}
+
+func (g *gatedExecutor) Run(ctx context.Context, _ []string, _ string, _ ...string) ([]byte, error) {
+	cur := g.inFlight.Add(1)
+	defer g.inFlight.Add(-1)
+	for {
+		prev := g.peak.Load()
+		if cur <= prev || g.peak.CompareAndSwap(prev, cur) {
+			break
+		}
+	}
+	select {
+	case <-g.release:
+		return []byte("ok"), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// TestRunRestic_SemaphoreLimitsConcurrency pins the runtime contract for
+// the new semaphore: with MaxConcurrency=2, four concurrent runRestic
+// calls must serialize through at most 2 executor invocations at a time
+// (issue #1). This is the test that would actually fail if someone broke
+// the semaphore (e.g., dropped the release).
+func TestRunRestic_SemaphoreLimitsConcurrency(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	gate := &gatedExecutor{release: make(chan struct{})}
+	client := NewClientWithExecutor(testRepoConfig(), testCreds(), logger, gate, Options{MaxConcurrency: 2})
+
+	const callers = 4
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			defer wg.Done()
+			_, _ = client.runRestic(context.Background(), nil, "restic", "snapshots")
+		}()
+	}
+
+	// Give all callers time to either reach the executor or block on the
+	// semaphore. 100ms is generous; the test is robust at 25ms.
+	time.Sleep(100 * time.Millisecond)
+
+	if got := gate.inFlight.Load(); got > 2 {
+		t.Errorf("in-flight executor calls = %d, want <= 2 (semaphore cap)", got)
+	}
+
+	close(gate.release)
+	wg.Wait()
+
+	if got := gate.peak.Load(); got > 2 {
+		t.Errorf("peak concurrent executor calls = %d, want <= 2 (semaphore cap)", got)
+	}
+}
+
+// TestRunRestic_NoCapWhenMaxConcurrencyZero pins that omitting the cap
+// preserves the legacy uncapped behavior — 4 concurrent calls land in the
+// executor simultaneously, not serialized through any semaphore.
+func TestRunRestic_NoCapWhenMaxConcurrencyZero(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	gate := &gatedExecutor{release: make(chan struct{})}
+	client := NewClientWithExecutor(testRepoConfig(), testCreds(), logger, gate, Options{})
+
+	const callers = 4
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			defer wg.Done()
+			_, _ = client.runRestic(context.Background(), nil, "restic", "snapshots")
+		}()
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	if got := gate.inFlight.Load(); got != callers {
+		t.Errorf("in-flight executor calls = %d, want %d (no cap)", got, callers)
+	}
+
+	close(gate.release)
+	wg.Wait()
+}
+
+// TestHealthCheck_HonorsConfiguredTimeout pins that HEALTH_CHECK_TIMEOUT
+// actually bounds the readiness probe's inner restic call (issue #1).
+// Sets a 50ms budget, gives the executor a 1s release horizon, expects
+// the probe to return DeadlineExceeded long before the 1s elapses.
+func TestHealthCheck_HonorsConfiguredTimeout(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	gate := &gatedExecutor{release: make(chan struct{})}
+	client := NewClientWithExecutor(testRepoConfig(), testCreds(), logger, gate, Options{HealthCheckTimeout: 50 * time.Millisecond})
+	client.mu.Lock()
+	client.connected = true
+	client.mu.Unlock()
+
+	start := time.Now()
+	err := client.HealthCheck(context.Background())
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("HealthCheck should fail when restic exceeds HealthCheckTimeout")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("HealthCheck err = %v, want errors.Is(err, context.DeadlineExceeded)", err)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("HealthCheck ran for %v before timing out; expected ~50ms (probe budget)", elapsed)
+	}
+	close(gate.release)
 }
 
 // TestConnect_Success pins the probe shape: `restic cat config` plus all

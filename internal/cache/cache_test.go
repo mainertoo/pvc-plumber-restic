@@ -38,7 +38,7 @@ func discardLogger() *slog.Logger {
 }
 
 func TestPreWarm_AddsEntriesWithoutEvicting(t *testing.T) {
-	c := New(&fakeBackend{}, time.Minute, discardLogger())
+	c := New(&fakeBackend{}, time.Minute, discardLogger(), backend.TypeKopiaS3)
 
 	c.PreWarm(map[string]bool{
 		testKey:      true,
@@ -61,7 +61,7 @@ func TestPreWarm_AddsEntriesWithoutEvicting(t *testing.T) {
 }
 
 func TestRefresh_ReplacesItemsAndEvictsMissing(t *testing.T) {
-	c := New(&fakeBackend{}, time.Minute, discardLogger())
+	c := New(&fakeBackend{}, time.Minute, discardLogger(), backend.TypeKopiaS3)
 
 	c.PreWarm(map[string]bool{
 		testKey:      true,
@@ -94,7 +94,7 @@ func TestRefresh_ReplacesItemsAndEvictsMissing(t *testing.T) {
 }
 
 func TestRefresh_ExtendsExpiryOfKeptEntries(t *testing.T) {
-	c := New(&fakeBackend{}, time.Minute, discardLogger())
+	c := New(&fakeBackend{}, time.Minute, discardLogger(), backend.TypeKopiaS3)
 
 	c.PreWarm(map[string]bool{testKey: true})
 	originalExpiry := c.items[testKey].expiresAt
@@ -110,8 +110,39 @@ func TestRefresh_ExtendsExpiryOfKeptEntries(t *testing.T) {
 	}
 }
 
+// TestBuildEntry_BackendSpecificSourceFormat pins that synthesized cache
+// entries report the actual backend type and a backend-shaped source
+// string. Issue #1 (cosmetic): the previous implementation hardcoded
+// TypeKopiaS3 + kopia-style source, so restic /exists responses lied
+// about which backend served the answer.
+func TestBuildEntry_BackendSpecificSourceFormat(t *testing.T) {
+	expiry := time.Now().Add(time.Minute)
+
+	kopia, ok := buildEntry("ns/data", true, expiry, backend.TypeKopiaS3)
+	if !ok {
+		t.Fatal("buildEntry returned ok=false for valid key")
+	}
+	if kopia.result.Backend != backend.TypeKopiaS3 {
+		t.Errorf("kopia entry Backend = %q, want %q", kopia.result.Backend, backend.TypeKopiaS3)
+	}
+	if kopia.result.Source != "data-backup@ns:/data" {
+		t.Errorf("kopia Source = %q, want kopia policy-source shape", kopia.result.Source)
+	}
+
+	restic, ok := buildEntry("ns/data", true, expiry, backend.TypeResticS3)
+	if !ok {
+		t.Fatal("buildEntry returned ok=false for valid key")
+	}
+	if restic.result.Backend != backend.TypeResticS3 {
+		t.Errorf("restic entry Backend = %q, want %q", restic.result.Backend, backend.TypeResticS3)
+	}
+	if restic.result.Source != "ns/data" {
+		t.Errorf("restic Source = %q, want bare ns/pvc tag", restic.result.Source)
+	}
+}
+
 func TestRefresh_SkipsMalformedKeys(t *testing.T) {
-	c := New(&fakeBackend{}, time.Minute, discardLogger())
+	c := New(&fakeBackend{}, time.Minute, discardLogger(), backend.TypeKopiaS3)
 
 	c.Refresh(map[string]bool{
 		"valid/key":     true,
@@ -130,7 +161,7 @@ func TestRefresh_SkipsMalformedKeys(t *testing.T) {
 
 func TestCheckBackupExists_ServesFromRefreshedCache(t *testing.T) {
 	bk := &fakeBackend{result: backend.CheckResult{Decision: backend.DecisionFresh, Authoritative: true}}
-	c := New(bk, time.Minute, discardLogger())
+	c := New(bk, time.Minute, discardLogger(), backend.TypeKopiaS3)
 
 	c.Refresh(map[string]bool{testKey: true})
 
@@ -173,7 +204,7 @@ func TestCheckBackupExists_SingleflightDedupsConcurrentLookups(t *testing.T) {
 			Backend:       backend.TypeKopiaS3,
 		},
 	}
-	c := New(bk, time.Minute, discardLogger())
+	c := New(bk, time.Minute, discardLogger(), backend.TypeKopiaS3)
 
 	const callers = 8
 	var wg sync.WaitGroup
@@ -212,7 +243,7 @@ func TestCheckBackupExists_FallsThroughOnEvictedEntry(t *testing.T) {
 		Decision:      backend.DecisionFresh,
 		Authoritative: true,
 	}}
-	c := New(bk, time.Minute, discardLogger())
+	c := New(bk, time.Minute, discardLogger(), backend.TypeKopiaS3)
 
 	c.Refresh(map[string]bool{testKey: true})
 	c.Refresh(map[string]bool{}) // evict everything
